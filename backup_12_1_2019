@@ -1,0 +1,255 @@
+/* --------0.Project information--------------------
+ * SIM800A
+ * Protocol communication: UART1
+ * The system need built-in UART functions and include of STRING.h
+      1. First the MCU need to initialize UART and define UART_ISR when data come in RX FIFO
+      2. MCU flush RX receive string to make sure the new data coming
+      3. MCU send command to SIM800A through UART
+      3. MCU receive EVERY character in UART_ISR (should have delay after send to wait for SIM respond)
+      4. Check the respond to see if it is appreciate or not
+ * Author : TRAN MINH THUAN
+---------------------------------------------------*/
+
+/* ------------------------------1.System requirement-------------------------------
+ * 1.Create a simple UART communication system send and receive 1 byte
+ * 4.Create a protocol to send data through a Master NRF24L01 to NRF24L01 slave
+     using Enhanced ShockBurst with IRQ pin Falling edge interrupt
+*/
+//Add libraries
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include "inc/hw_types.h"
+#include "inc/hw_memmap.h"
+#include "driverlib/sysctl.h"
+#include "driverlib/sysctl.c"
+#include "driverlib/pin_map.h"
+#include "driverlib/gpio.h"
+#include "driverlib/gpio.c"
+#include "driverlib/uart.h"
+#include "driverlib/uart.c"
+#include "driverlib/interrupt.h"
+#include "driverlib/interrupt.c"
+//Define Variables
+#define RX1_PIN          GPIO_PIN_0
+#define TX1_PIN          GPIO_PIN_1
+#define IP_Adress        "171.235.62.21"
+#define PORT             "2015"
+
+char OK[5]={'O','K',0x0D,0x0A};
+char Data_Recv_SIM[100];
+char Respond_OK=0;
+char SIM_startTCP_command[50]={"AT+CIPSTART=TCP,"};
+char SIM_data[50]={"THUAN QUA VIP"};       //Message send to SIM with CIPSEND
+uint16_t count_recv_SIM=0;                 //variable count data SIM receive
+uint16_t  Error_SIM_send_cmd=0;
+uint16_t  Send_comp=0;
+uint16_t Send_TCPcomp=0;
+void UART_TransmitCommand(char *command);
+void str_flush(char *string, unsigned int length);
+void SIM_Init(void);
+bool SIM_TCPSend(char *datasource);
+bool SIM_Respond(char *correct_resp);
+bool SIM_SendCMD_Comp(char *command,
+                      char *correct_res,
+                      int   time_try);
+
+/* UART 1 INTERRUPT HANDLER
+ * Function: Receive data from UART driver then store in Data_Recv_SIM_UART
+ * Input: No
+ * Output: No
+ * Affect to variable:
+    - String Data_Recv_SIM - Store data receive from module SIM
+    - count_recv_SIM       - Number of character receive
+*/
+void Receive_ISR(void)
+{
+    uint32_t ui32Status;
+    ui32Status = UARTIntStatus(UART1_BASE, true);     //get interrupt status /value true because they're masked interrupt (they are enabled by code)
+    UARTIntClear(UART1_BASE, ui32Status);             //clear the asserted interrupts
+    while(UARTCharsAvail(UART1_BASE)==1)
+    {
+        Data_Recv_SIM[count_recv_SIM]=UARTCharGet(UART1_BASE);  //Store data
+        count_recv_SIM++;                                       //go to next place holder
+    }
+}
+
+int main(void){
+    // Clock configure at 80Mhz
+    SysCtlClockSet(SYSCTL_SYSDIV_2_5 | SYSCTL_USE_PLL | SYSCTL_OSC_MAIN | SYSCTL_XTAL_16MHZ);
+    // UART configure
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_UART1);
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOB);
+    GPIOPinConfigure(GPIO_PB0_U1RX);            //PIN mux for UART
+    GPIOPinConfigure(GPIO_PB1_U1TX);            //PIN mux for UART
+    GPIOPinTypeUART(GPIO_PORTB_BASE, RX1_PIN |TX1_PIN);
+    UARTConfigSetExpClk(UART1_BASE, SysCtlClockGet(), 115200,(UART_CONFIG_WLEN_8 | UART_CONFIG_STOP_ONE | UART_CONFIG_PAR_NONE));
+    // Interrupt configure
+    IntMasterEnable();
+    IntEnable(INT_UART1);
+    UARTIntRegister(UART1_BASE, Receive_ISR);            //If don't have timeout, system will interrupt after receive 8 bits data
+    UARTIntEnable(UART1_BASE, UART_INT_RX| UART_INT_RT); //Receive and receive timeout in case of data don't come after 30 cycles
+    // LED CONFIG
+    SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOF);
+    SIM_Init();
+    //TEST SEND
+    while (1)
+    {
+//        SIM_TCPSend(SIM_data);
+        SIM_TCPSend("CONNECT OK");
+        SysCtlDelay(SysCtlClockGet()/1000);
+    }
+}
+
+/* UART_TransmitCommand(char *command)
+ * Function: Transmit string command to UART device
+ * Input: *command - Pointer to command
+ * Output: No
+*/
+void UART_TransmitCommand(char *command)
+{
+        while(UARTBusy(UART1_BASE));
+        while(*command != '\0')
+        {
+            UARTCharPut(UART1_BASE, *command++);
+        }
+        UARTCharPut(UART1_BASE,0x0D);                        //Send extra in order for SIM respond
+}
+
+/* str_flush(char *string, unsigned int length)
+ * Function: Clear the assign string
+ * Input: *string - Pointer to string
+          *length - The length of string
+ * Output: No
+*/
+void str_flush(char *string, unsigned int length)
+{
+    int count_str_flush=0;
+    for(;count_str_flush<length;count_str_flush++) string[count_str_flush]=0;
+}
+
+/* SIM_Init(void)
+ * Function: Initialization for SIM800
+ * Input:    None
+ * Output:   None
+*/
+void SIM_Init(void)
+{
+   SIM_SendCMD_Comp("AT",OK,10);          //Checking module operation and synchronize Speed -> OK
+   SysCtlDelay(SysCtlClockGet()/30000);
+   SIM_SendCMD_Comp("ATE0", OK, 2);       //Disable Echo back
+   SysCtlDelay(SysCtlClockGet()/30000);   //Delay after send command successfully (100us)
+   SIM_SendCMD_Comp("AT+CIPMUX=0",OK,2);  //Single connection -> OK
+   SysCtlDelay(SysCtlClockGet()/30000);                            //Delay after send command successfully (100us)
+   SIM_SendCMD_Comp("AT+CPIN?",OK,2);     //Check for Password ->OK
+   SysCtlDelay(SysCtlClockGet()/30000);                            //Delay after send command successfully (100us)
+   SIM_SendCMD_Comp("AT+CREG?",OK,2);     //Check register network -> OK
+   SysCtlDelay(SysCtlClockGet()/30000);                            //Delay after send command successfully (100us)
+   SIM_SendCMD_Comp("AT+CGATT=1",OK,2);   //Attach GPRS       -> OK
+   SysCtlDelay(SysCtlClockGet()/30000);                            //Delay after send command successfully (100us)
+   SIM_SendCMD_Comp("AT+CIPSHUT",OK,2);   //Close all previous connection -> SHUT "OK"
+   SysCtlDelay(SysCtlClockGet()/30000);
+   strcat(SIM_startTCP_command, IP_Adress); //creating start TCP connection message
+   strcat(SIM_startTCP_command, ",");
+   strcat(SIM_startTCP_command, PORT);
+   SIM_SendCMD_Comp(SIM_startTCP_command,"ALREADY CONNECT",5);  //If connect OK
+}
+
+/* SIM_Respond(char *correct_resp)
+ * Function: Check the respond from SIM
+ * Input: *correct_resp - the correct respond from SIM
+ * Output:
+             -1:The Data_Recv_SIM contain correct_resp
+             -0:Received wrong information
+*/
+bool SIM_Respond(char *correct_resp)
+{
+    int8_t count_correct=0;
+    count_recv_SIM=0;                              //reset count receive UART to compare
+    while(Data_Recv_SIM[count_recv_SIM]!=0)        //receive string hasn't end yet
+    {
+        if (correct_resp[count_correct] == Data_Recv_SIM[count_recv_SIM]) count_correct++;
+        count_recv_SIM++;
+        if(count_correct==strlen(correct_resp))
+        return 1;
+    }
+    return 0;
+}
+
+/* SIM_SendCMD_Comp(char *command,
+                    char *correct_res,
+                    int  time_try)
+ * Function: Send command to SIM800 and check for respond if false re-send with limit time try
+     0. Clear the receive string and its place holder
+     1. Check to see if reach the limit time try
+     2. If not and hasn't receive appropriate respond then send command and wait for respond
+ * Input:  *command         - command to send to SIM
+           *correct_res     - expected respond
+            time_try        - max time re-send command
+ * Output:
+           1: send and receive correct respond
+           0: if not
+ * Change function by changing the delay time
+ * Affect variable:  Error_SIM_send_cmd++s
+*/
+bool SIM_SendCMD_Comp(char *command,
+                      char *correct_res,
+                      int  time_try)
+{
+    uint16_t count_send_cmd=0;  //re-send command if SIM doesn't respond
+    for(count_send_cmd=0;count_send_cmd<time_try;count_send_cmd++)   //Send maximum time_try times and wait for "OK" respond
+    {
+        count_recv_SIM=0;                                    //clear receive string and counter receive
+        str_flush(Data_Recv_SIM,strlen(Data_Recv_SIM));      //in order to receive clean value and delete old things
+        UART_TransmitCommand(command);
+        SysCtlDelay(SysCtlClockGet()/1000);                      //Delay after send command successfully
+        if(SIM_Respond(correct_res)==1)
+        {
+            Send_comp+=1;
+            return 1;
+        }
+    }
+    Error_SIM_send_cmd+=1;
+    return 0;
+}
+
+/* SIM_TCPSend(char *datatcp)
+ * Function: Send data to TCP server
+     1. Connect to TCP
+     2. Send data to TCP
+     3. Close and wait for the next connection
+ * Input:  char *datatcp - pointer to data to send
+ * Output: No
+ * Change function by changing the max times try in each SIM_CMD_COMP and delay time to wait for respond
+*/
+bool SIM_TCPSend(char *datatcp)
+{
+    int  count_try=0;
+    if(SIM_SendCMD_Comp(SIM_startTCP_command,"ALREADY CONNECT",3)==1)  //If connect OK
+    {
+        if(SIM_SendCMD_Comp("AT+CIPSEND",">",3)==1)    //Send and wait for ">"
+        {
+                count_recv_SIM=0;                                    //clear receive string and counter receive
+                str_flush(Data_Recv_SIM,strlen(Data_Recv_SIM));      //in order to receive clean value and delete old things
+                UART_TransmitCommand(datatcp);
+                UARTCharPut(UART1_BASE, 0X0D);
+                UARTCharPut(UART1_BASE, 0X0A);
+                UARTCharPut(UART1_BASE, 0X1A);
+                for(count_try=0;count_try<30000;count_try++)
+                {
+                    SysCtlDelay(SysCtlClockGet()/30000);
+                    if(SIM_Respond("OK")==1)
+                    {
+                        Send_TCPcomp++;
+                        return 1;
+                    }
+                }
+        }
+    }
+    Error_SIM_send_cmd++;
+    return 0;
+}
+
+
+
+
